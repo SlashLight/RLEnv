@@ -1,0 +1,27 @@
+{
+  "provider": "openai-codex",
+  "model": "gpt-5.6-luna",
+  "thinking": "off",
+  "api_key": "",
+  "api_key_env": "",
+  "auth_file": "~/.pi/agent/auth.json",
+  "runs_dir": "runs",
+  "tasks_dir": "tasks",
+  "port": 8765,
+  "limits": {
+    "prepare_seconds": 120,
+    "agent_seconds": 900,
+    "tool_seconds": 60,
+    "replay_seconds": 120
+  },
+  "tool_output_limit_bytes": 262144,
+  "submission_limit_bytes": 10485760,
+  "event_limit_bytes": 1048576,
+  "docker": {
+    "tools_image": "pipeline-tools:latest",
+    "task_cpus": 1,
+    "task_memory": "256m",
+    "tools_memory": "512m",
+    "service_start_seconds": 30
+  }
+}
