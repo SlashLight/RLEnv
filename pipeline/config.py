@@ -21,6 +21,11 @@ class Limits:
     agent_seconds: float = 900
     tool_seconds: float = 60
     replay_seconds: float = 120
+    token_budget: int = 200000
+
+    def __post_init__(self) -> None:
+        if type(self.token_budget) is not int or self.token_budget <= 0:
+            raise ConfigError("limits.token_budget must be a positive integer")
 
 
 @dataclass

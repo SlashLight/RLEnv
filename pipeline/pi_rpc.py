@@ -24,7 +24,7 @@ class PiError(RuntimeError):
 class PiSession:
     def __init__(self, cfg: Config, log: EventLog, run_dir: Path, extension_path: Path,
                  gateway_url: str, gateway_token: str, provider: str, model: str,
-                 thinking: str):
+                 thinking: str, *, local: bool = True):
         self.cfg = cfg
         self.log = log
         self.run_dir = Path(run_dir)
@@ -34,6 +34,11 @@ class PiSession:
         self.provider = provider
         self.model = model
         self.thinking = thinking
+        self.local = local
+        self.submitted = threading.Event()
+        self.budget_stop_reason: str | None = None
+        self._budget_ready = threading.Event()
+        self.usage_path = self.run_dir / "usage.json"
         self.process: subprocess.Popen[bytes] | None = None
         self._pending: dict[str, dict[str, Any]] = {}
         self._pending_lock = threading.Lock()
@@ -62,6 +67,12 @@ class PiSession:
             "NO_COLOR": "1",
             "CI": "1",
         })
+        if self.local:
+            env.update({
+                "PIPELINE_LOCAL": "1",
+                "PIPELINE_TOKEN_BUDGET": str(self.cfg.limits.token_budget),
+                "PIPELINE_USAGE_PATH": str(self.usage_path.resolve()),
+            })
         (self.run_dir / "pi-home").mkdir(exist_ok=True)
         (self.run_dir / "pi-tmp").mkdir(exist_ok=True)
         return env
@@ -81,6 +92,14 @@ class PiSession:
         pi = shutil.which("pi")
         if not pi:
             raise PiError("pi executable not found in PATH")
+        if self.local:
+            try:
+                version = subprocess.run([pi, "--version"], capture_output=True, text=True,
+                                         timeout=10, check=True).stdout.strip()
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise PiError(f"cannot verify pinned pi build: {exc}") from exc
+            if version != "1.5.2":
+                raise PiError(f"local token accounting requires pi 1.5.2, found {version!r}")
         argv = [
             pi, "--mode", "rpc", "--no-session",
             "--no-extensions", "-e", str(self.extension_path),
@@ -90,6 +109,8 @@ class PiSession:
             "--provider", self.provider, "--model", self.model,
             "--thinking", self.thinking,
         ]
+        if self.local:
+            argv += ["-e", str(Path(__file__).parent / "extensions" / "token_budget.ts")]
         key = self.cfg.resolved_api_key()
         if key:
             argv += ["--api-key", key]
@@ -98,6 +119,14 @@ class PiSession:
     def start(self) -> None:
         env = self._env()
         self._prepare_auth_dir(env)
+        if self.local:
+            self.usage_path.write_text(json.dumps({
+                "schema": "evaluator-pipeline/usage/v1", "ready": False,
+                "token_budget": self.cfg.limits.token_budget, "total_tokens": 0,
+                "prompt_tokens": 0, "completion_tokens": 0, "requests": 0,
+                "usage_reliable": True, "stop_reason": None,
+                "cost": {"kind": "unknown", "value": None, "currency": "USD"},
+            }) + "\n", encoding="utf-8")
         (self.run_dir / "pi-cwd").mkdir(exist_ok=True)
         self._stderr_handle = (self.run_dir / "raw" / "pi.stderr.log").open("ab")
         self.process = subprocess.Popen(
@@ -120,9 +149,15 @@ class PiSession:
                 f"pi exited during startup ({self.exit_code}); see raw/pi.stderr.log"
             )
         # No automatic retries inside the run; compaction stays allowed.
-        self.command("set_auto_retry", enabled=False, timeout=10)
-        self.command("set_auto_compaction", enabled=True, timeout=10)
+        retry = self.command("set_auto_retry", enabled=False, timeout=10)
+        compaction = self.command("set_auto_compaction", enabled=True, timeout=10)
+        if self.local and (not retry.get("success") or not compaction.get("success")):
+            raise PiError("cannot configure trusted pi retry/compaction policy")
         state = self.command("get_state", timeout=10)
+        if self.local:
+            if (not self._budget_ready.wait(10) or self.api_error
+                    or not state.get("success")):
+                raise PiError(self.api_error or "token budget extension did not become ready")
         self.log.publish("runner", "pi_started", {"state": state.get("data")})
 
     def _read_stdout(self) -> None:
@@ -145,6 +180,29 @@ class PiSession:
 
     def _inspect(self, record: dict[str, Any]) -> None:
         kind = record.get("type")
+        if self.local and kind == "extension_ui_request" and record.get("method") == "notify":
+            message = record.get("message")
+            if isinstance(message, str) and message.startswith("PIPELINE_BUDGET:"):
+                try:
+                    payload = json.loads(message.removeprefix("PIPELINE_BUDGET:"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("budget event must be an object")
+                except (ValueError, TypeError) as exc:
+                    self.api_error = f"invalid budget extension event: {exc}"
+                    return
+                record = {"type": "pipeline_budget", **payload}
+                kind = "pipeline_budget"
+        if kind == "pipeline_budget" and self.local:
+            usage = record.get("usage") or {}
+            self.log.publish("budget", str(record.get("event", "unknown")), usage)
+            if record.get("event") == "ready" and usage.get("ready") is True:
+                self._budget_ready.set()
+            reason = usage.get("stop_reason")
+            if reason in ("token_limit", "usage_unknown"):
+                self.budget_stop_reason = reason
+                if reason == "usage_unknown":
+                    self.api_error = "provider usage is unknown; further requests are forbidden"
+            return
         if kind == "response":
             request_id = record.get("id")
             if request_id:
@@ -213,6 +271,10 @@ class PiSession:
     def wait_settled(self, deadline: float,
                      stop_event: threading.Event | None = None) -> str:
         while True:
+            if self.local and self.submitted.is_set():
+                return "submitted"
+            if self.local and self.budget_stop_reason:
+                return self.budget_stop_reason
             if stop_event is not None and stop_event.is_set():
                 self.request_stop()
             # Settled means no work remains, not that the attempt succeeded.
@@ -221,7 +283,16 @@ class PiSession:
             if self._stop_requested.is_set():
                 return "stopped"
             if self._settled.is_set():
-                return "settled"
+                if not self.local:
+                    return "settled"
+                if time.monotonic() < deadline:
+                    self._settled.clear()
+                    response = self.prompt(
+                        "Continue research and improve the solution. Only explicit submission "
+                        "ends research; use the submit tool when the final artifacts are ready."
+                    )
+                    if response.get("success") is False:
+                        self.api_error = str(response.get("error") or "continuation failed")
             if self._exited.is_set():
                 return "error"
             if time.monotonic() >= deadline:
@@ -237,6 +308,14 @@ class PiSession:
             self._close_process()
         finally:
             self._cleanup_profile()
+            if self.local and self.usage_path.exists():
+                usage = json.loads(self.usage_path.read_text(encoding="utf-8"))
+                if not usage.get("usage_reliable"):
+                    usage["stop_reason"] = "usage_unknown"
+                    usage["cost"] = {"kind": "unknown", "value": None, "currency": "USD"}
+                    self.budget_stop_reason = "usage_unknown"
+                    self.usage_path.write_text(json.dumps(usage) + "\n", encoding="utf-8")
+                    self.log.publish("runner", "budget_usage_unknown", usage)
 
     def _close_process(self) -> None:
         if not self.process:
@@ -270,8 +349,11 @@ class PiSession:
             thread.join(timeout=5)
 
     def _signal_group(self, sig: int) -> None:
+        process = self.process
+        if process is None:
+            return
         try:
-            os.killpg(self.process.pid, sig)
+            os.killpg(process.pid, sig)
         except ProcessLookupError:
             pass
 

@@ -22,12 +22,14 @@ class Gateway:
         self.log = log
         self.output_limit = output_limit
         self.token = secrets.token_urlsafe(32)
+        self.submitted = threading.Event()
+        self._operation_lock = threading.Lock()
         gateway = self
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
-            def log_message(self, *_args: Any) -> None:  # noqa: D401 - silence stderr
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: D401 - silence stderr
                 return
 
             def _reply(self, status: int, payload: dict[str, Any]) -> None:
@@ -93,6 +95,16 @@ class Gateway:
         self.server.server_close()
 
     def handle(self, op: str, request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        with self._operation_lock:
+            if self.submitted.is_set():
+                raise SandboxError("submission is frozen")
+            if op == "submit":
+                self.sandbox.stop()
+                self.submitted.set()
+                return {"submitted": True}, {"op": "submit"}
+            return self._handle_open(op, request)
+
+    def _handle_open(self, op: str, request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         sandbox = self.sandbox
         if op == "read":
             path = str(request["path"])

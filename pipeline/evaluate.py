@@ -6,11 +6,16 @@ session. Replay may start a fresh task instance, never a model.
 
 from __future__ import annotations
 
+import html
 import json
+import shutil
+import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from .docker import DockerError
 from .milestones import evaluate_milestones
 from .runlog import read_events, read_records
 from .reward import build_reward
@@ -19,6 +24,7 @@ from .util import read_json, sha256_file, tree_manifest, truncate_text, write_js
 CONFIRMED = "confirmed"
 NOT_CONFIRMED = "not_confirmed"
 CHECK_ERROR = "check_error"
+NOT_EVALUATED = "not_evaluated"
 SCRIPT_NAME = "solution.py"
 FLAG_NAME = "flag.txt"
 
@@ -35,6 +41,9 @@ class ReplayResult:
     stdout_truncated: bool = False
     stderr_truncated: bool = False
     syntax_check: dict[str, Any] | None = None
+    oom_killed: bool = False
+    infrastructure_error: bool = False
+    check_error: str | None = None
 
 
 class ReplayEnvironment(Protocol):
@@ -334,7 +343,9 @@ def check_script(package: dict[str, Any], env: ReplayEnvironment | None,
     run_dir: Path = package["run_dir"]
     manifest = package["submission_manifest"]
     submission = run_dir / "submission"
-    base = {"check": "script", "evidence": []}
+    base = {"check": "script", "evidence": [],
+            "predicate": "Clean isolated replay exits 0, without timeout or stdout truncation, "
+                         "and stdout is exactly the different main flag (optional LF/CRLF)."}
 
     if manifest is None:
         return {**base, "verdict": CHECK_ERROR, "reason": "submission_manifest_unavailable",
@@ -356,36 +367,45 @@ def check_script(package: dict[str, Any], env: ReplayEnvironment | None,
     if not script.is_file() or script.is_symlink():
         return {**base, "verdict": NOT_CONFIRMED, "reason": "script_missing",
                 "explanation": f"No regular submission/{SCRIPT_NAME} was submitted."}
+    if script.stat().st_nlink != 1:
+        return {**base, "verdict": NOT_CONFIRMED, "reason": "invalid_submission",
+                "explanation": "Hard-linked solution scripts are not permitted."}
     if env is None:
-        return {**base, "verdict": CHECK_ERROR, "reason": "replay_environment_unavailable",
-                "explanation": "No replay environment is configured for this evaluation."}
+        return {**base, "verdict": NOT_EVALUATED, "reason": "replay_not_run",
+                "explanation": "Replay was not started; no negative result is inferred."}
+    if not new_flag or package.get("expected_flag") is None or new_flag == package["expected_flag"]:
+        return {**base, "verdict": CHECK_ERROR, "reason": "flag_rotation_unverified",
+                "explanation": "Replay requires a main flag proven different from the original."}
 
     evidence_dir.mkdir(parents=True, exist_ok=True)
     result: ReplayResult | None = None
-    prepare_error: Exception | None = None
-    run_error: Exception | None = None
+    failure: Exception | None = None
     cleanup_errors: list[str] = []
+    staged: Path | None = None
     try:
+        # The environment interface receives no flags, journals, helpers or other run files.
+        staged = Path(tempfile.mkdtemp(prefix="replay-input-", dir=evidence_dir))
+        shutil.copyfile(script, staged / SCRIPT_NAME)
         url = env.prepare(new_flag)
-        try:
-            result = env.run(submission, url, replay_timeout)
-        except Exception as exc:  # noqa: BLE001 - environment failures must not look negative
-            run_error = exc
-    except Exception as exc:  # noqa: BLE001
-        prepare_error = exc
+        result = env.run(staged, url, replay_timeout)
+    except Exception as exc:  # environment failures must not look negative
+        failure = exc
     finally:
         try:
-            cleanup_errors = env.close()
-        except Exception as exc:  # cleanup must not erase the check result
-            cleanup_errors = [f"{type(exc).__name__}: {exc}"]
-    if prepare_error is not None:
+            cleanup_errors.extend(env.close())
+        except Exception as exc:
+            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+        if staged is not None:
+            try:
+                shutil.rmtree(staged)
+            except OSError as exc:
+                cleanup_errors.append(f"replay input cleanup: {exc}")
+    if failure is not None:
         return {**base, "verdict": CHECK_ERROR, "reason": "environment_error",
-                "explanation": f"A clean task instance could not be prepared: {prepare_error}",
-                "cleanup_errors": cleanup_errors}
-    if run_error is not None:
-        return {**base, "verdict": CHECK_ERROR, "reason": "environment_error",
-                "explanation": f"The replay environment failed: {run_error}",
-                "cleanup_errors": cleanup_errors}
+                "explanation": f"The replay environment failed: {type(failure).__name__}: {failure}",
+                "infrastructure_error": isinstance(failure, DockerError),
+                "cleanup_errors": cleanup_errors,
+                "evidence": [_evidence_file(script, run_dir)]}
     assert result is not None
 
     stdout_path = evidence_dir / "stdout.txt"
@@ -396,47 +416,57 @@ def check_script(package: dict[str, Any], env: ReplayEnvironment | None,
     stderr_cut |= result.stderr_truncated
     stdout_path.write_text(stdout_text, encoding="utf-8")
     stderr_path.write_text(stderr_text, encoding="utf-8")
-    evidence = [
-        _evidence_file(stdout_path, run_dir),
-        _evidence_file(stderr_path, run_dir),
-        _evidence_file(script, run_dir),
-    ]
+    evidence = [_evidence_file(stdout_path, run_dir), _evidence_file(stderr_path, run_dir),
+                _evidence_file(script, run_dir)]
 
     def verdict(value: str, reason: str, explanation: str) -> dict[str, Any]:
         return {
-            **base,
-            "verdict": value,
-            "reason": reason,
-            "explanation": explanation,
-            "evidence": evidence,
-            "command": result.command,
-            "exit_code": result.exit_code,
-            "duration_ms": result.duration_ms,
-            "timed_out": result.timed_out,
-            "fresh_instance": True,
-            "stdout_truncated": stdout_cut,
-            "stderr_truncated": stderr_cut,
-            "environment": result.environment or {},
-            "syntax_check": result.syntax_check,
+            **base, "verdict": value, "reason": reason, "explanation": explanation,
+            "evidence": evidence, "command": result.command, "exit_code": result.exit_code,
+            "duration_ms": result.duration_ms, "timed_out": result.timed_out,
+            "oom_killed": result.oom_killed, "fresh_instance": True,
+            "stdout_truncated": stdout_cut, "stderr_truncated": stderr_cut,
+            "environment": result.environment or {}, "syntax_check": result.syntax_check,
+            "infrastructure_error": result.infrastructure_error,
             "cleanup_errors": cleanup_errors,
         }
 
-    if cleanup_errors:
-        return verdict(CHECK_ERROR, "cleanup_error",
-                       "Replay finished but its resources could not be fully cleaned up.")
-    if result.timed_out:
-        return verdict(NOT_CONFIRMED, "script_timeout",
-                       f"The script did not finish within {replay_timeout:g} seconds on a healthy instance.")
-    if result.exit_code != 0:
-        return verdict(NOT_CONFIRMED, "script_exit_nonzero",
-                       f"The script exited with code {result.exit_code}.")
+    integrity_error = _submission_integrity(run_dir, manifest)
+    if integrity_error:
+        return verdict(CHECK_ERROR, "submission_integrity_error", integrity_error)
+    if result.infrastructure_error:
+        return verdict(CHECK_ERROR, "environment_error",
+                       result.check_error or "A confirmed infrastructure failure interrupted replay.")
     wanted = new_flag.encode("utf-8")
     produced = result.stdout.encode("utf-8")
-    if not stdout_cut and produced in (wanted, wanted + b"\r\n", wanted + b"\n"):
+    if (not result.check_error and result.exit_code == 0 and not result.timed_out
+            and not result.oom_killed and not stdout_cut
+            and produced in (wanted, wanted + b"\r\n", wanted + b"\n")):
         return verdict(CONFIRMED, "script_reproduced",
-                       "A fresh instance with a new flag was solved: exit code 0 and exactly the new flag on stdout.")
+                       "A clean instance was solved with exit 0 and exactly its different main flag on stdout.")
+    task_state = (result.environment or {}).get("task_container_state")
+    if task_state is not None:
+        if (task_state.get("OOMKilled") is True or task_state.get("Error")
+                or task_state.get("Status") in {"exited", "dead", "removing"}):
+            return {**verdict(CHECK_ERROR, "environment_error",
+                             "Docker confirmed the task service failed during replay."),
+                    "infrastructure_error": True}
+        if task_state.get("Status") != "running":
+            return verdict(CHECK_ERROR, "task_health_unknown",
+                           "The task service was not confirmed running; script failure is not proven.")
+    if result.check_error:
+        return verdict(CHECK_ERROR, "environment_error", result.check_error)
+    if result.timed_out:
+        return verdict(NOT_CONFIRMED, "script_timeout",
+                       f"The trusted supervisor enforced the {replay_timeout:g} second script limit.")
+    if result.oom_killed:
+        return verdict(NOT_CONFIRMED, "script_oom", "Docker confirmed replay exceeded its memory limit.")
+    if result.exit_code is None or result.exit_code < 0:
+        return verdict(CHECK_ERROR, "unclassified_exit", "No reliable script exit status is available.")
+    if result.exit_code != 0:
+        return verdict(NOT_CONFIRMED, "script_exit_nonzero", f"The script exited with code {result.exit_code}.")
     return verdict(NOT_CONFIRMED, "script_wrong_output",
-                   "stdout did not contain exactly the new flag (or contained more than it).")
+                   "stdout was truncated or did not contain exactly the new flag.")
 
 
 # -- report --------------------------------------------------------------
@@ -444,8 +474,11 @@ def check_script(package: dict[str, Any], env: ReplayEnvironment | None,
 def _solution_status(flag_check: dict[str, Any], script_check: dict[str, Any]) -> dict[str, Any]:
     checks = (flag_check, script_check)
     if any(item["verdict"] == CHECK_ERROR for item in checks):
-        return {"solved": False, "status": "check_error",
-                "note": "A check could not run; this is not a negative result."}
+        return {"solved": None, "status": CHECK_ERROR,
+                "note": "A required check failed technically; no reliable solution verdict is available."}
+    if any(item["verdict"] == NOT_EVALUATED for item in checks):
+        return {"solved": None, "status": NOT_EVALUATED,
+                "note": "A required check has not run; no complete solution verdict is available."}
     solved = all(item["verdict"] == CONFIRMED for item in checks)
     return {
         "solved": solved,
@@ -459,28 +492,58 @@ def evaluate(run_dir: Path, *, replay_env_factory: Callable[[], ReplayEnvironmen
              execute_replay: bool = True) -> dict[str, Any]:
     run_dir = Path(run_dir)
     package = load_package(run_dir)
+    is_remote = bool(package["passport"].get("remote_url"))
+    if not is_remote and package["passport"].get("schema") != "evaluator-pipeline/passport/v2":
+        raise ValueError("Local evaluation requires evaluator-pipeline/passport/v2; historical packages are unchanged.")
     events = package["events"]
     chronology, health = build_chronology(events)
     data_health = build_data_health(run_dir, events)
     data_health.update({key: value for key, value in health.items() if key not in data_health})
 
-    flag_check = check_flag(package)
+    try:
+        flag_check = check_flag(package)
+    except OSError as exc:
+        flag_check = {"check": "flag", "verdict": CHECK_ERROR, "reason": "flag_evidence_unavailable",
+                      "explanation": f"Cannot read flag evidence: {exc}", "evidence": []}
 
-    is_remote = bool(package["passport"].get("remote_url"))
-    env: ReplayEnvironment | None = None
-    if not is_remote and execute_replay and replay_env_factory is not None and new_flag:
-        env = replay_env_factory()
-    script_check = ({
-        "check": "script", "verdict": "not_evaluated", "reason": "remote_no_replay",
+    if not is_remote:
+        flag_check["predicate"] = "Submitted flag.txt equals the original main flag (optional LF/CRLF)."
+        if not flag_check["evidence"]:
+            flag_check["evidence"] = [_evidence_file(run_dir / "submission_manifest.json", run_dir)]
+    script_check = {
+        "check": "script", "verdict": NOT_EVALUATED, "reason": "remote_no_replay",
         "explanation": "Remote task: no replay, reset or flag rotation.", "evidence": [],
-    } if is_remote else check_script(
-        package, env, replay_timeout, new_flag or "",
-        run_dir / "checks" / "replay",
-    ))
+    }
+    if not is_remote:
+        attempts = []
+        for _ in range(2):
+            attempt_id = uuid.uuid4().hex
+            evidence_dir = run_dir / "checks" / "replay" / attempt_id
+            env = None
+            factory_error = None
+            try:
+                if execute_replay and replay_env_factory is not None:
+                    env = replay_env_factory()
+            except Exception as exc:
+                factory_error = exc
+            script_check = check_script(package, env, replay_timeout, new_flag or "", evidence_dir)
+            if factory_error is not None:
+                script_check.update(verdict=CHECK_ERROR, reason="environment_error",
+                                    explanation=f"Replay creation failed: {factory_error}",
+                                    infrastructure_error=isinstance(factory_error, DockerError))
+            script_check.update(attempt_id=attempt_id,
+                                run_id=package["passport"].get("run_id", run_dir.name))
+            write_json(evidence_dir / "result.json", script_check)
+            script_check["evidence"].append(_evidence_file(evidence_dir / "result.json", run_dir))
+            attempts.append(script_check)
+            if not script_check.get("infrastructure_error"):
+                break
+        script_check = {**script_check, "attempts": attempts,
+                        "basis_attempt_id": script_check["attempt_id"]}
 
     status = package["status"]
     report = {
-        "schema": "evaluator-pipeline/report/v1",
+        "schema": "evaluator-pipeline/report/v1" if is_remote else "evaluator-pipeline/report/v2",
         "run_id": package["passport"].get("run_id", status.get("run_id")),
         "package": str(run_dir),
         "publication_ready": False,
@@ -490,6 +553,7 @@ def evaluate(run_dir: Path, *, replay_env_factory: Callable[[], ReplayEnvironmen
             "status": "ok" if status.get("status") != "failed" else "error",
             "stage": status.get("stage"),
             "error": status.get("error"),
+            "cleanup_errors": status.get("cleanup_errors", []),
         },
         "stop_reason": status.get("stop_reason", {"kind": "unknown"}),
         "data_health": data_health,
@@ -507,8 +571,27 @@ def evaluate(run_dir: Path, *, replay_env_factory: Callable[[], ReplayEnvironmen
                      if is_remote else _solution_status(flag_check, script_check)),
     }
     report["milestones"] = evaluate_milestones(package)
-    report["reward"] = build_reward(report, events, report["milestones"])
-    write_json(run_dir / "checks" / "reward.json", report["reward"])
+    if is_remote:
+        report["reward"] = build_reward(report, events, report["milestones"])
+        write_json(run_dir / "checks" / "reward.json", report["reward"])
+    else:
+        usage_path = run_dir / "usage.json"
+        observation_path = run_dir / "observations.json"
+        report["budgets"] = {"limits": package["passport"].get("limits", {}),
+                             "time_usage": status.get("time_usage", {})}
+        try:
+            report["usage"] = read_json(usage_path) if usage_path.exists() else None
+        except (OSError, ValueError):
+            report["usage"] = {"status": "unknown", "reason": "usage_receipt_unreadable"}
+        try:
+            report["observations"] = read_json(observation_path) if observation_path.exists() else {
+                "status": "available" if (run_dir / "observations.md").is_file() else "missing"}
+        except (OSError, ValueError):
+            report["observations"] = {"status": "unknown"}
+        if (run_dir / "observations.md").is_file():
+            report["observations"]["path"] = "observations.md"
+        report["current_activity"] = status.get("current_activity", status.get("stage"))
+        report["event_details"] = events
     write_json(run_dir / "checks" / "milestones.json", report["milestones"])
     write_json(run_dir / "checks" / "flag.json", flag_check)
     write_json(run_dir / "checks" / "replay.json", script_check)
@@ -522,9 +605,11 @@ def _fmt_check(item: dict[str, Any]) -> str:
         f"event {entry['seq']}" if entry.get("kind") == "event" else str(entry.get("path"))
         for entry in item.get("evidence", [])
     )
-    return (
-        f"**{item['check']}**: `{item['verdict']}` (`{item['reason']}`) — {item['explanation']}"
+    return html.escape(
+        f"**{item['check']}**: `{item['verdict']}` (`{item['reason']}`) — {item.get('explanation', '')}"
         + (f"\nEvidence: {refs}" if refs else "")
+        + (f"\nPredicate: {item['predicate']}" if item.get("predicate") else "")
+        + (f"\nCleanup errors: {item['cleanup_errors']}" if item.get("cleanup_errors") else "")
     )
 
 
@@ -567,6 +652,38 @@ def render_markdown(report: dict[str, Any]) -> str:
         for item in report.get("milestones", {}).get("checks", []):
             lines.append(f"- Milestone `{item.get('id')}`: `{item.get('verdict')}`")
         lines += ["", "## Data health", ""]
+    if report.get("schema") == "evaluator-pipeline/report/v2":
+        lines[-2:] = []
+        lines += ["", "## Replay attempts", "",
+                  f"Basis attempt: `{report['script_check'].get('basis_attempt_id', 'none')}`"]
+        for attempt in report["script_check"].get("attempts", []):
+            lines += ["", f"### Attempt `{attempt['attempt_id']}`", _fmt_check(attempt),
+                      "<details><summary>Attempt evidence and execution</summary><pre>"
+                      + html.escape(json.dumps(attempt, ensure_ascii=False, indent=2)) + "</pre></details>"]
+        lines += ["", "## Intermediate checks", ""]
+        milestones = report.get("milestones", {})
+        lines.append(f"Availability: `{milestones.get('status')}` ({milestones.get('reason') or 'configured'}).")
+        for check in milestones.get("checks", []):
+            lines.append(_fmt_check(check))
+        lines.append("<details><summary>Intermediate-check submissions and evidence</summary><pre>"
+                     + html.escape(json.dumps(milestones, ensure_ascii=False, indent=2))
+                     + "</pre></details>")
+        lines += ["", "## Budgets and usage", "",
+                  f"Current activity: `{html.escape(str(report.get('current_activity')))}`",
+                  "Unknown usage/cost is no data, not zero.",
+                  "<details><summary>Limits, stage times, tokens and cost</summary><pre>"
+                  + html.escape(json.dumps({"budgets": report.get("budgets"),
+                                            "usage": report.get("usage")},
+                                           ensure_ascii=False, indent=2)) + "</pre></details>",
+                  "", "## Agent observations (claims, not evidence)", ""]
+        observations = report.get("observations", {})
+        lines.append(f"Status: `{observations.get('status', 'unknown')}`.")
+        if observations.get("path"):
+            lines.append("[Read observations](observations.md)")
+        if report.get("pipeline", {}).get("cleanup_errors"):
+            lines += ["", "Cleanup errors (do not cancel check verdicts):",
+                      html.escape(json.dumps(report["pipeline"]["cleanup_errors"], ensure_ascii=False))]
+        lines += ["", "## Data health", ""]
     health = report["data_health"]
     lines += [
         f"- Events: {health.get('events')}, raw pi records: {health.get('raw_records')}",
@@ -584,19 +701,29 @@ def render_markdown(report: dict[str, Any]) -> str:
         if entry["kind"] == "tool_call":
             status = entry["status"]
             lines.append(
-                f"- [{entry['start_event']}→{entry['end_event']}] `{entry['tool']}` "
-                f"`{json.dumps(entry.get('args'), ensure_ascii=False)}` — **{status}**"
+                f"- [{entry['start_event']}→{entry['end_event']}] `{html.escape(str(entry['tool']))}` "
+                f"`{html.escape(json.dumps(entry.get('args'), ensure_ascii=False))}` — **{status}**"
                 + (" (truncated)" if entry.get("truncated") else "")
                 + (f", {entry['duration_ms']} ms" if entry.get("duration_ms") is not None else "")
             )
             result = (entry.get("result_text") or "").strip()
             if result:
                 preview = result[:600] + ("…" if len(result) > 600 else "")
-                lines.append(f"  - result [{entry['end_event']}]: `{preview}`")
+                lines.append(f"  - result [{entry['end_event']}]: `{html.escape(preview)}`")
         elif entry["kind"] == "tool_result_orphan":
-            lines.append(f"- [{entry['event']}] orphan result for `{entry.get('tool')}`")
+            lines.append(f"- [{entry['event']}] orphan result for `{html.escape(str(entry.get('tool')))}`")
         elif entry["kind"] == "assistant_message":
             preview = entry["text"][:400] + ("…" if len(entry["text"]) > 400 else "")
-            lines.append(f"- [{entry['event']}] assistant: {preview}"
+            lines.append(f"- [{entry['event']}] assistant: {html.escape(preview)}"
                          + (" (truncated)" if entry.get("truncated") else ""))
+        if report.get("schema") == "evaluator-pipeline/report/v2" and entry.get("truncated"):
+            lines.append("Recorded preview is truncated; [open raw records](raw/rpc.jsonl).")
+        if report.get("schema") == "evaluator-pipeline/report/v2":
+            lines.append("<details><summary>Full chronology entry</summary><pre>"
+                         + html.escape(json.dumps(entry, ensure_ascii=False, indent=2))
+                         + "</pre></details>")
+    if report.get("schema") == "evaluator-pipeline/report/v2":
+        lines += ["", "<details><summary>Full recorded messages, commands and results</summary><pre>"
+                  + html.escape(json.dumps(report.get("event_details", []), ensure_ascii=False, indent=2))
+                  + "</pre></details>"]
     return "\n".join(lines) + "\n"

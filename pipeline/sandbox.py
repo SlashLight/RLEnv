@@ -125,7 +125,7 @@ class Sandbox:
 
     def start(self) -> None:
         self.tools_image_id = docker.ensure_tools_image(self.cfg, self.pipeline_dir)
-        self.tools_image = self.cfg.docker.tools_image
+        self.tools_image = self.tools_image_id
         docker.create_network(self.network)
         docker.start_tools_container(
             self.tools_image, self.network, self.container, self.workspace, self.cfg
@@ -134,6 +134,8 @@ class Sandbox:
 
     def stop(self) -> None:
         """Terminate all tool processes before copying evidence from the container."""
+        if self.stopped:
+            return
         docker.stop_container(self.container)
         self.stopped = True
 

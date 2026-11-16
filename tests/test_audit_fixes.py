@@ -33,7 +33,7 @@ def package(root):
 def test_damaged_submission_is_not_graded(tmp_path, damage, local):
     root = package(tmp_path / 'r1')
     if local:
-        write_json(root / 'passport.json', {})
+        write_json(root / 'passport.json', {'schema': 'evaluator-pipeline/passport/v2'})
     flag = root / 'submission/flag.txt'
     if damage == 'missing':
         flag.unlink()
@@ -167,7 +167,7 @@ def lifecycle(tmp_path, monkeypatch):
     session.wait_settled.return_value = 'settled'
     relay = Mock()
     monkeypatch.setattr(module, 'Sandbox', lambda *a: sandbox)
-    monkeypatch.setattr(module, 'PiSession', lambda *a: session)
+    monkeypatch.setattr(module, 'PiSession', lambda *a, **kw: session)
     monkeypatch.setattr(module, 'Gateway', lambda *a: Mock(url='gateway', token='token'))
     monkeypatch.setattr(module, '_tool_version', lambda *a: 'test')
     monkeypatch.setattr(module.remote, 'start_relay', relay)
@@ -263,6 +263,9 @@ def test_replay_preparation_has_shared_deadline_and_separate_cleanup(tmp_path, m
     from pipeline.task import load_task
     cfg = Config('p', 'm')
     cfg.limits.prepare_seconds = 2
+    pinned = 'sha256:' + 'a' * 64
+    write_json(tmp_path / 'passport.json', {'environment': {'tools_image_id': pinned}})
+    monkeypatch.setattr(docker, 'image_id', lambda image: pinned)
     env = DockerReplayEnvironment(cfg, load_task('my-flask-app', Path('tasks')), tmp_path)
     clock, calls = [10.0], []
     monkeypatch.setattr(docker.time, 'monotonic', lambda: clock[0])
@@ -313,7 +316,7 @@ def test_sandbox_bounds_output_and_refuses_partial_file(tmp_path, monkeypatch):
 def test_truncated_replay_prefix_cannot_confirm_solution(tmp_path):
     from pipeline.evaluate import ReplayResult
     root = package(tmp_path / 'r1')
-    write_json(root / 'passport.json', {})
+    write_json(root / 'passport.json', {'schema': 'evaluator-pipeline/passport/v2'})
     (root / 'submission/solution.py').write_text('pass')
     write_json(root / 'submission_manifest.json', {
         'present': True, 'health': 'ok', 'files': tree_manifest(root / 'submission'),

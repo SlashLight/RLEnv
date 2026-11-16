@@ -10,6 +10,7 @@ from typing import Any
 
 from .util import utcnow, write_json
 
+EVENT_SCHEMA = "evaluator-pipeline/event/v2"
 PER_STRING_LIMIT = 131072
 
 
@@ -37,10 +38,12 @@ class EventLog:
     original pi records with line numbers that normalized events reference.
     """
 
-    def __init__(self, run_dir: Path, run_id: str, event_limit_bytes: int = 1024 * 1024):
+    def __init__(self, run_dir: Path, run_id: str, event_limit_bytes: int = 1024 * 1024,
+                 *, local_contract: bool = True):
         self.run_dir = Path(run_dir)
         self.run_id = run_id
         self.event_limit_bytes = event_limit_bytes
+        self.local_contract = local_contract
         self.seq = 0
         self.raw_line = 0
         self._lock = threading.Lock()
@@ -62,17 +65,27 @@ class EventLog:
                 "type": kind,
                 "data": payload,
             }
+            if self.local_contract:
+                event.update(schema=EVENT_SCHEMA, raw_refs=[], truncated=False,
+                             incomplete=bool(self.recording_errors))
             if "raw_line" in extra:
-                event["raw_line"] = extra.pop("raw_line")
+                raw_line = extra.pop("raw_line")
+                event["raw_line"] = raw_line
+                if self.local_contract:
+                    event["raw_refs"].append({"path": "raw/rpc.jsonl", "line": raw_line})
             event.update(extra)
             if flags:
                 event["truncated"] = True
                 event["truncation"] = flags
+            if self.local_contract:
+                event["incomplete"] = bool(event["incomplete"] or event["truncated"])
             line = json.dumps(event, ensure_ascii=False)
             if len(line.encode("utf-8")) > self.event_limit_bytes:
                 event["data"] = {"_truncated": True, "bytes": len(line.encode("utf-8"))}
                 event["truncated"] = True
                 event["truncation"] = {**flags, "event_bytes": len(line.encode("utf-8"))}
+                if self.local_contract:
+                    event["incomplete"] = True
                 line = json.dumps(event, ensure_ascii=False)
             try:
                 self._events.write(line + "\n")
@@ -148,11 +161,14 @@ class EventCursor:
         self._offset = 0
         self._last_seq = 0
         self._anchor = b""
+        self.recording_errors: list[dict[str, Any]] = []
+        self.incomplete_tail = False
 
     def read(self, run_dir: Path, after: int) -> list[dict[str, Any]]:
         with self._lock:
             try:
                 with (run_dir / "events.jsonl").open("rb") as fh:
+                    self.incomplete_tail = False
                     stat = os.fstat(fh.fileno())
                     identity = (stat.st_dev, stat.st_ino)
                     fh.seek(max(0, self._offset - len(self._anchor)))
@@ -160,27 +176,40 @@ class EventCursor:
                     if (identity != self._identity or stat.st_size < self._offset
                             or after < self._last_seq or anchor != self._anchor):
                         self._offset = self._last_seq = 0
+                        self.recording_errors = []
                     self._identity = identity
                     fh.seek(self._offset)
                     events = []
                     while line := fh.readline():
                         # The writer may still be appending this record.
                         if not line.endswith(b"\n"):
+                            self.incomplete_tail = True
                             break
                         self._offset = fh.tell()
                         try:
                             event = json.loads(line)
-                        except (ValueError, UnicodeDecodeError):
+                        except (ValueError, UnicodeDecodeError) as exc:
+                            self.recording_errors.append({
+                                "stream": "events.jsonl", "offset": self._offset - len(line),
+                                "error": str(exc),
+                            })
                             continue
                         if isinstance(event, dict) and type(event.get("seq")) is int:
                             self._last_seq = max(self._last_seq, event["seq"])
                             if event["seq"] > after:
                                 events.append(event)
+                        else:
+                            self.recording_errors.append({
+                                "stream": "events.jsonl", "offset": self._offset - len(line),
+                                "error": "event is not an object with an integer sequence",
+                            })
                     fh.seek(max(0, self._offset - 256))
                     self._anchor = fh.read(min(256, self._offset))
                     return events
-            except OSError:
+            except OSError as exc:
                 self._identity = None
+                self.recording_errors = [{"stream": "events.jsonl", "error": str(exc)}]
+                self.incomplete_tail = True
                 return []
 
 
