@@ -19,6 +19,7 @@ import {
 	createReadTool,
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 
 const WORKSPACE = "/workspace";
 const gatewayUrl = process.env.PIPELINE_GATEWAY_URL;
@@ -122,4 +123,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool(createWriteTool(WORKSPACE, { operations: writeOps() }));
 	pi.registerTool(createEditTool(WORKSPACE, { operations: editOps() }));
 	pi.registerTool(createBashTool(WORKSPACE, { operations: bashOps() }));
+	if (process.env.PIPELINE_LOCAL === "1") pi.registerTool({
+		name: "submit",
+		label: "Submit solution",
+		description: "Freeze the final submission and finish research. Files cannot be changed afterward.",
+		parameters: Type.Object({}),
+		async execute() {
+			await callGateway("submit", {}, 120_000);
+			return { content: [{ type: "text", text: "Submission frozen." }], details: {} };
+		},
+	});
 }

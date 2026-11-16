@@ -22,7 +22,7 @@ def test_notebook_report_works_from_different_cwd(tmp_path, monkeypatch, action)
                   if f'/{{RUN_ID}}/{action}\"' in ''.join(cell['source']))
     monkeypatch.chdir(tmp_path)
     root = Path('runs/r1')
-    write_json(root / 'passport.json', {'run_id': 'r1'})
+    write_json(root / 'passport.json', {'run_id': 'r1', 'schema': 'evaluator-pipeline/passport/v2'})
     write_json(root / 'status.json', {'status': 'done'})
     report = evaluate(root, execute_replay=False)
     runner = Runner(Config('p', 'm', runs_dir=(tmp_path / 'runs')))
@@ -52,7 +52,7 @@ def test_terminal_outcome_precedence(tmp_path, condition, expected):
     log = EventLog(tmp_path, 'r1')
     try:
         session = PiSession(Config('p', 'm'), log, tmp_path, Path('bridge.ts'),
-                            'http://gateway', 'token', 'p', 'm', 'off')
+                            'http://gateway', 'token', 'p', 'm', 'off', local=False)
         if condition == 'model_error':
             session._inspect({'type': 'message_end', 'message': {
                 'role': 'assistant', 'stopReason': 'error', 'errorMessage': 'API failed',

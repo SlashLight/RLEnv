@@ -17,7 +17,7 @@ from pipeline.util import ProcessResult, tree_manifest, write_json
 
 
 def package(root):
-    write_json(root / 'passport.json', {'run_id': 'r1'})
+    write_json(root / 'passport.json', {'run_id': 'r1', 'schema': 'evaluator-pipeline/passport/v2'})
     write_json(root / 'status.json', {'status': 'done'})
     write_json(root / 'submission_manifest.json', {
         'present': True, 'health': 'ok', 'violations': [], 'files': [],
@@ -64,8 +64,9 @@ def test_cleanup_does_not_swallow_daemon_failure(monkeypatch, remove):
         remove('test-resource')
 
 
+@pytest.mark.parametrize('outcome', ['submitted', 'time_limit', 'usage_unknown', 'transport_error'])
 @pytest.mark.parametrize('evaluation_fails', [True, False])
-def test_runner_stops_before_snapshot_and_preserves_materials(tmp_path, monkeypatch, evaluation_fails):
+def test_runner_stops_before_snapshot_and_preserves_materials(tmp_path, monkeypatch, evaluation_fails, outcome):
     import pipeline.runner as module
     cfg = Config('p', 'm', runs_dir=tmp_path)
     runner = Runner(cfg)
@@ -82,11 +83,14 @@ def test_runner_stops_before_snapshot_and_preserves_materials(tmp_path, monkeypa
     }
     session = Mock()
     session.prompt.return_value = {'success': True, 'data': {'disposition': 'queued'}}
-    session.wait_settled.return_value = 'settled'
+    session.wait_settled.return_value = outcome
+    if outcome == 'transport_error':
+        session.wait_settled.side_effect = RuntimeError('connection dropped')
     session.saw_tool_call = True
     gateway = Mock(url='http://gateway', token='token')
+    gateway.submitted = threading.Event()
     monkeypatch.setattr(module, 'Sandbox', lambda *a: sandbox)
-    monkeypatch.setattr(module, 'PiSession', lambda *a: session)
+    monkeypatch.setattr(module, 'PiSession', lambda *a, **kw: session)
     monkeypatch.setattr(module, 'Gateway', lambda *a: gateway)
     monkeypatch.setattr(module, '_tool_version', lambda *a: 'test')
     monkeypatch.setattr(docker, 'build_task_image', lambda *a, **kw: 'task-id')
@@ -94,12 +98,16 @@ def test_runner_stops_before_snapshot_and_preserves_materials(tmp_path, monkeypa
     monkeypatch.setattr(docker, 'check_ready', lambda *a, **kw: None)
     monkeypatch.setattr(docker, 'remove_container', lambda *a, **kw: None)
     monkeypatch.setattr(docker, 'remove_image', lambda *a, **kw: None)
+    monkeypatch.setattr(module, 'verify_canary_deployment', lambda *a: None)
     evaluator = Mock(side_effect=RuntimeError('evaluator broken') if evaluation_fails else None,
                      return_value={})
     monkeypatch.setattr(module, 'evaluate', evaluator)
     runner._execute('r1', cfg)
     status = json.loads((root / 'status.json').read_text())
-    assert status['status'] == ('failed' if evaluation_fails else 'done')
+    assert status['status'] == ('failed' if evaluation_fails or outcome == 'transport_error' else 'done')
+    assert status['stop_reason']['kind'] == (
+        'infra_error' if evaluation_fails or outcome in {'usage_unknown', 'transport_error'} else outcome)
+    assert json.loads((root / 'submission_manifest.json').read_text())['frozen_at']
     if evaluation_fails:
         assert 'evaluator broken' in status['evaluation_error']
     assert evaluator.call_count == 1
@@ -108,3 +116,20 @@ def test_runner_stops_before_snapshot_and_preserves_materials(tmp_path, monkeypa
     assert not (root / 'workspace').exists()
     assert sandbox.method_calls.index(next(c for c in sandbox.method_calls if c[0] == 'stop')) < \
         sandbox.method_calls.index(next(c for c in sandbox.method_calls if c[0] == 'snapshot_submission'))
+
+
+def test_submission_freeze_rejects_later_changes():
+    from pipeline.gateway import Gateway
+    from pipeline.sandbox import SandboxError
+    sandbox = Mock()
+    log = Mock()
+    gateway = Gateway(sandbox, log, 1024)
+    try:
+        assert not gateway.submitted.is_set()
+        gateway.handle('submit', {})
+        sandbox.stop.assert_called_once()
+        assert gateway.submitted.is_set()
+        with pytest.raises(SandboxError, match='frozen'):
+            gateway.handle('write', {'path': '/workspace/submission/solution.py', 'data': ''})
+    finally:
+        gateway.close()

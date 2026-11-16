@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -174,6 +175,8 @@ def test_supervisor_stdout_cannot_be_opened_through_proc(tmp_path):
 def test_gateway_propagates_receipt_and_supports_old_sandbox():
     gateway = object.__new__(Gateway)
     gateway.sandbox = Mock()
+    gateway._operation_lock = threading.Lock()
+    gateway.submitted = threading.Event()
     result = dict(exit_code=0, timed_out=False, output='ok', truncated=False, duration_ms=1)
     gateway.sandbox.bash.return_value = result
     payload, audit = gateway.handle('bash', {'command': 'echo ok'})
@@ -183,85 +186,102 @@ def test_gateway_propagates_receipt_and_supports_old_sandbox():
     assert payload['syntax_check'] == audit['syntax_check'] == result['syntax_check']
 
 
-@pytest.mark.parametrize('source, verdict', [
-    ('raise RuntimeError("must not execute")', 'valid'),
-    ('if :', 'invalid'),
-    ('import missing_dependency', 'valid'),
+@pytest.mark.parametrize("source, syntax, code, timed_out", [
+    ("print('flag')", "valid", 0, False),
+    ("if :", "invalid", 1, False),
+    ("raise SystemExit(124)", "valid", 124, False),
+    ("raise SystemExit(137)", "valid", 137, False),
+    ("import time; time.sleep(5)", "valid", 137, True),
 ])
-def test_python_parser_does_not_execute_or_import_submission(tmp_path, source, verdict):
-    (tmp_path / 'solution.py').write_text(source)
-    for name in ('json.py', 'hashlib.py', 'sitecustomize.py'):
-        (tmp_path / name).write_text('raise RuntimeError("submission import")')
-    # Replace only the final execution; the trusted checker itself is unchanged.
-    code = 'import os\nos.execv = lambda *args: None\n' + _PYTHON_SYNTAX_AND_RUN
-    proc = subprocess.run([sys.executable, '-I', '-S', '-c', code, 'http://task'],
-                          cwd=tmp_path, capture_output=True, timeout=5)
-    assert proc.returncode == 0, proc.stderr
-    receipt = json.loads(proc.stdout.decode().removeprefix(_SYNTAX_PREFIX))
-    assert receipt['verdict'] == verdict
-    assert receipt['source_sha256'] == hashlib.sha256(source.encode()).hexdigest()
-
-
-def test_python_receipt_precedes_normal_replay_execution(tmp_path):
-    (tmp_path / 'solution.py').write_text('import sys, helper\nprint(helper.value, sys.argv[1])')
-    (tmp_path / 'helper.py').write_text('value = "flag"')
+def test_replay_supervisor_proves_child_exit_and_timeout(tmp_path, source, syntax, code, timed_out):
+    (tmp_path / "solution.py").write_text(source)
     proc = subprocess.run(
-        [sys.executable, '-I', '-S', '-c', _PYTHON_SYNTAX_AND_RUN, 'http://task'],
+        [sys.executable, "-I", "-S", "-c", _PYTHON_SYNTAX_AND_RUN, "http://task", ".1", "1024"],
         cwd=tmp_path, capture_output=True, timeout=5,
     )
     assert proc.returncode == 0, proc.stderr
-    header, output = proc.stdout.decode().split('\n', 1)
-    assert json.loads(header.removeprefix(_SYNTAX_PREFIX))['verdict'] == 'valid'
-    assert output == 'flag http://task\n'
+    receipt = json.loads(proc.stdout.decode().removeprefix(_SYNTAX_PREFIX))
+    assert receipt["syntax_check"]["verdict"] == syntax
+    assert receipt["exit_code"] == code
+    assert receipt["timed_out"] is timed_out
+    assert receipt["syntax_check"]["source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
 
 
-def replay(tmp_path, monkeypatch, output, *, limit=1024, code=0, timeout=False):
-    submission = tmp_path / 'submission'
+def test_replay_supervisor_receipt_cannot_be_forged(tmp_path):
+    (tmp_path / "solution.py").write_text(
+        'import os, sys\n'
+        'try:\n'
+        '    open(f"/proc/{os.getppid()}/fd/1", "w").write("FORGED")\n'
+        'except PermissionError:\n'
+        '    pass\n'
+        'print(\'{"timed_out":true,"exit_code":0}\')\n'
+        'print(sys.argv[1], file=sys.stderr)\n'
+    )
+    proc = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", _PYTHON_SYNTAX_AND_RUN, "http://task", "1", "1024"],
+        cwd=tmp_path, capture_output=True, timeout=5,
+    )
+    receipt = json.loads(proc.stdout.decode().removeprefix(_SYNTAX_PREFIX))
+    assert receipt["exit_code"] == 0 and not receipt["timed_out"]
+    assert base64.b64decode(receipt["stdout_b64"]) == b'{"timed_out":true,"exit_code":0}\n'
+    assert base64.b64decode(receipt["stderr_b64"]) == b"http://task\n"
+
+
+def replay(tmp_path, monkeypatch, output, *, limit=1024, code=0, timeout=False, oom=False):
+    submission = tmp_path / "submission"
     submission.mkdir()
-    (submission / 'solution.py').write_text('pass')
-    env = DockerReplayEnvironment(Config('p', 'm', tool_output_limit_bytes=limit), Mock(), tmp_path)
-    env.tools_image = 'tools'
-    failure = subprocess.TimeoutExpired(['docker'], 1, output=output, stderr=b'')
-    run = Mock(side_effect=failure) if timeout else Mock(return_value=ProcessResult(code, output, b''))
-    monkeypatch.setattr('pipeline.replay.run_bounded', run)
-    state = {'Status': 'exited', 'ExitCode': code, 'Error': '', 'OOMKilled': False}
-    inspect = Mock(return_value=ProcessResult(0, json.dumps(state).encode(), b''))
-    monkeypatch.setattr(docker, 'docker', inspect)
-    monkeypatch.setattr(docker, 'remove_container', Mock())
-    return env.run(submission, 'http://task', 1), run
+    (submission / "solution.py").write_text("pass")
+    env = DockerReplayEnvironment(Config("p", "m", tool_output_limit_bytes=limit), Mock(), tmp_path)
+    env.tools_image = "sha256:pinned"
+    failure = subprocess.TimeoutExpired(["docker"], 1, output=output, stderr=b"")
+    run = Mock(side_effect=failure) if timeout else Mock(return_value=ProcessResult(code, output, b""))
+    monkeypatch.setattr("pipeline.replay.run_bounded", run)
+    state = {"Status": "exited", "ExitCode": code, "Error": "", "OOMKilled": oom}
+    monkeypatch.setattr(docker, "docker",
+                        Mock(return_value=ProcessResult(0, json.dumps(state).encode(), b"")))
+    return env.run(submission, "http://task", 1), run, env
 
 
-def receipt(verdict='valid'):
-    return (_SYNTAX_PREFIX + json.dumps({'verdict': verdict, 'language': 'python'}) + '\n').encode()
+def receipt(output=b"flag", *, code=0, timed_out=False, truncated=False):
+    return (_SYNTAX_PREFIX + json.dumps({
+        "syntax_check": {"verdict": "valid"}, "exit_code": code, "timed_out": timed_out,
+        "stdout_b64": base64.b64encode(output).decode(), "stderr_b64": "",
+        "stdout_truncated": truncated, "stderr_truncated": False,
+    }) + "\n").encode()
 
 
-def test_replay_strips_only_trusted_first_receipt(tmp_path, monkeypatch):
-    forged = receipt('invalid')
-    result, run = replay(tmp_path, monkeypatch, receipt() + b'flag\n' + forged)
-    assert result.syntax_check['verdict'] == 'valid'
-    assert result.stdout == 'flag\n' + forged.decode()
+def test_replay_receipt_preserves_script_output_and_launch_contract(tmp_path, monkeypatch):
+    result, run, env = replay(tmp_path, monkeypatch, receipt(b"flag\n" + _SYNTAX_PREFIX.encode()))
+    assert result.stdout == "flag\n" + _SYNTAX_PREFIX
+    assert result.syntax_check["verdict"] == "valid"
     command = run.call_args.args[0]
-    assert command[-6:] == ['/usr/local/bin/python', '-I', '-S', '-c', _PYTHON_SYNTAX_AND_RUN, 'http://task']
-    for option in ('--read-only', '--memory', '--cpus', '--pids-limit', '--cap-drop'):
+    assert command[-7:] == ["-I", "-S", "-c", _PYTHON_SYNTAX_AND_RUN, "http://task", "1", "1024"]
+    for option in ("--read-only", "--memory", "--cpus", "--pids-limit", "--cap-drop"):
         assert option in command
-    assert run.call_args.kwargs['timeout'] == 21
+    assert command[command.index("-v") + 1].endswith(":/submission:ro")
+    assert run.call_args.kwargs["timeout"] == 21
+    assert {p.name for p in env.submission_copy.iterdir()} == {"solution.py"}
 
 
 def test_replay_preserves_output_limit(tmp_path, monkeypatch):
-    result, run = replay(tmp_path, monkeypatch, receipt() + b'123456789', limit=5)
-    assert result.stdout == '12345' and result.stdout_truncated
-    assert run.call_args.kwargs['output_limit'] == 5 + _SYNTAX_HEADER_LIMIT
+    result, run, _ = replay(tmp_path, monkeypatch, receipt(b"12345", truncated=True), limit=5)
+    assert result.stdout == "12345" and result.stdout_truncated
+    assert run.call_args.kwargs["output_limit"] == 4 * 5 + _SYNTAX_HEADER_LIMIT
 
 
-@pytest.mark.parametrize('output, verdict', [(b'flag', 'check_error'),
-                                            (receipt() + b'partial', 'valid')])
-def test_replay_timeout_does_not_invent_syntax_failure(tmp_path, monkeypatch, output, verdict):
-    result, _ = replay(tmp_path, monkeypatch, output, timeout=True)
-    assert result.timed_out
-    assert result.syntax_check['verdict'] == verdict
+@pytest.mark.parametrize("code", [0, 124, 137])
+def test_exit_code_without_receipt_does_not_prove_script_failure(tmp_path, monkeypatch, code):
+    result, _, _ = replay(tmp_path, monkeypatch, b"unclassified output", code=code)
+    assert result.check_error and not result.timed_out and not result.oom_killed
+    assert not result.infrastructure_error
 
 
-def test_old_replay_mock_output_is_preserved(tmp_path, monkeypatch):
-    result, _ = replay(tmp_path, monkeypatch, b'flag')
-    assert result.stdout == 'flag'
-    assert result.syntax_check['verdict'] == 'check_error'
+def test_docker_watchdog_is_not_a_proven_script_timeout(tmp_path, monkeypatch):
+    result, _, _ = replay(tmp_path, monkeypatch, b"", timeout=True)
+    assert result.check_error and not result.timed_out
+    assert not result.infrastructure_error
+
+
+def test_inspected_oom_is_a_solution_failure(tmp_path, monkeypatch):
+    result, _, _ = replay(tmp_path, monkeypatch, b"", code=137, oom=True)
+    assert result.oom_killed and not result.infrastructure_error and not result.check_error

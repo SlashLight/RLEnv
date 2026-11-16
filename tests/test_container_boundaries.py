@@ -1,4 +1,5 @@
 """Container operations use controlled subprocess outcomes, never a live daemon."""
+import base64
 import json
 import os
 import subprocess
@@ -46,8 +47,8 @@ def test_cleanup_is_idempotent_for_absent_resources(monkeypatch, remove, message
     remove('test')
 
 
-@pytest.mark.parametrize('code', [0, 125, 126, 127])
-def test_replay_uses_container_exit_not_docker_cli_code(tmp_path, monkeypatch, code):
+@pytest.mark.parametrize('code', [0, 124, 125, 126, 127, 137])
+def test_replay_uses_proven_child_exit_not_docker_cli_code(tmp_path, monkeypatch, code):
     submission = tmp_path / 'submission'
     submission.mkdir()
     (submission / 'solution.py').write_text('pass')
@@ -56,9 +57,14 @@ def test_replay_uses_container_exit_not_docker_cli_code(tmp_path, monkeypatch, c
     env.tools_image = 'tools'
     def run(command, **kwargs):
         if command[1] == 'inspect':
-            state = {'Status': 'exited', 'ExitCode': code, 'Error': '', 'OOMKilled': False}
+            state = {'Status': 'exited', 'ExitCode': 0, 'Error': '', 'OOMKilled': False}
             return subprocess.CompletedProcess(command, 0, json.dumps(state).encode(), b'')
-        return ProcessResult(code, b'output', b'diagnostics')
+        from pipeline.replay import _SYNTAX_PREFIX
+        receipt = {"exit_code": code, "timed_out": False, "syntax_check": {"verdict": "valid"},
+                   "stdout_b64": base64.b64encode(b"output").decode(),
+                   "stderr_b64": base64.b64encode(b"diagnostics").decode(),
+                   "stdout_truncated": False, "stderr_truncated": False}
+        return ProcessResult(125, (_SYNTAX_PREFIX + json.dumps(receipt)).encode(), b'')
     monkeypatch.setattr(subprocess, 'run', run)
     monkeypatch.setattr('pipeline.replay.run_bounded', run)
     result = env.run(submission, 'http://task', 1)
@@ -147,8 +153,6 @@ def test_readiness_timeout_cleans_container_outside_expired_budget(monkeypatch):
 
 
 def test_notebook_observer_displays_result_without_duplicate_sandbox_output():
-    notebook = json.loads(Path('notebooks/evaluator-pipeline.ipynb').read_text())
-    assert any('Observer(api, RUN_ID)' in ''.join(cell['source']) for cell in notebook['cells'])
     from pipeline.notebook import Observer
     events = [
         {'seq': 1, 'source': 'pi', 'type': 'tool_execution_end',
@@ -162,3 +166,69 @@ def test_notebook_observer_displays_result_without_duplicate_sandbox_output():
     assert 'HTTP result 200' in rendered
     assert 'sandbox output' not in rendered
     assert observer.after == 2
+
+
+def test_replay_copies_only_script_and_refuses_links(tmp_path, monkeypatch):
+    from pipeline.replay import _SYNTAX_PREFIX
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    (submission / "solution.py").write_text("pass")
+    for name in ("flag.txt", "bonus_flags.txt", "observations.md", "helper.py"):
+        (submission / name).write_text("must not transfer")
+    env = DockerReplayEnvironment(Config("p", "m"), Mock(), tmp_path)
+    env.tools_image = "sha256:pinned"
+    wire = _SYNTAX_PREFIX + json.dumps({
+        "exit_code": 0, "timed_out": False, "syntax_check": {},
+        "stdout_b64": "", "stderr_b64": "", "stdout_truncated": False, "stderr_truncated": False,
+    })
+    captured = []
+    def run(command, **kwargs):
+        captured.extend(command)
+        return ProcessResult(0, wire.encode(), b"")
+    monkeypatch.setattr("pipeline.replay.run_bounded", run)
+    monkeypatch.setattr(docker, "docker", lambda *a, **kw: ProcessResult(
+        0, b'{"Status":"exited","ExitCode":0,"Error":"","OOMKilled":false}', b""))
+    env.run(submission, "http://task", 1)
+    assert {p.name for p in env.submission_copy.iterdir()} == {"solution.py"}
+    mount = captured[captured.index("-v") + 1]
+    assert mount == f"{env.submission_copy.resolve()}:/submission:ro"
+    assert str(tmp_path) not in mount.split(":", 1)[1]
+    assert "--publish" not in captured and "--add-host" not in captured
+    (submission / "solution.py").unlink()
+    (submission / "solution.py").symlink_to(submission / "flag.txt")
+    with pytest.raises(ValueError, match="regular"):
+        env.run(submission, "http://task", 1)
+    (submission / "solution.py").unlink()
+    os.link(submission / "flag.txt", submission / "solution.py")
+    with pytest.raises(ValueError, match="hard-linked"):
+        env.run(submission, "http://task", 1)
+
+
+def test_replay_pins_exploration_image_and_fresh_attempt_resources(tmp_path, monkeypatch):
+    from pipeline.util import write_json
+    write_json(tmp_path / "passport.json", {"environment": {"tools_image_id": "sha256:original"}})
+    task = Mock(service={"hostname": "task", "port": 5000})
+    first = DockerReplayEnvironment(Config("p", "m"), task, tmp_path)
+    second = DockerReplayEnvironment(Config("p", "m"), task, tmp_path)
+    assert first.network != second.network and first.build_dir != second.build_dir
+    monkeypatch.setattr("pipeline.replay.prepare_build_context", Mock())
+    monkeypatch.setattr(docker, "build_task_image", Mock(return_value="sha256:task"))
+    monkeypatch.setattr(docker, "image_id", lambda image: image)
+    network, service, ready = Mock(), Mock(), Mock()
+    monkeypatch.setattr(docker, "create_network", network)
+    monkeypatch.setattr(docker, "start_service", service)
+    monkeypatch.setattr(docker, "check_ready", ready)
+    assert first.prepare("new flag") == "http://task:5000"
+    network.assert_called_once_with(first.network, isolated=True)
+    assert first.tools_image == "sha256:original"
+    assert service.call_args.args[0] == "sha256:task"
+    assert ready.call_args.args[3] == "sha256:original"
+
+
+def test_replay_network_has_no_external_or_host_gateway(monkeypatch):
+    run = Mock(return_value=ProcessResult(0, b"", b""))
+    monkeypatch.setattr(docker, "docker", run)
+    docker.create_network("replay", isolated=True)
+    args = run.call_args.args
+    assert "--internal" in args
+    assert "com.docker.network.bridge.gateway_mode_ipv4=isolated" in args

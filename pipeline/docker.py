@@ -9,7 +9,7 @@ import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, cast
 
 from .config import Config
 from .util import ProcessResult, run_bounded
@@ -43,6 +43,8 @@ def docker(*args: str, input_data: bytes | None = None, timeout: float | None = 
         timeout = min(timeout, remaining) if timeout is not None else remaining
     try:
         if output_limit is not None:
+            if timeout is None:
+                raise ValueError("bounded Docker output requires an explicit timeout")
             proc = run_bounded(["docker", *args], input_data=input_data,
                                timeout=timeout, output_limit=output_limit)
         else:
@@ -92,8 +94,10 @@ def build_task_image(context_dir: Path, tag: str, timeout: float = 600) -> str:
     return built
 
 
-def create_network(name: str) -> None:
-    proc = docker("network", "create", "--driver", "bridge", "--internal", name, check=False)
+def create_network(name: str, *, isolated: bool = False) -> None:
+    # Isolated gateway mode gives the internal bridge no host-side gateway address.
+    options = ("--opt", "com.docker.network.bridge.gateway_mode_ipv4=isolated") if isolated else ()
+    proc = docker("network", "create", "--driver", "bridge", "--internal", *options, name, check=False)
     if proc.returncode != 0 and b"already exists" not in proc.stderr:
         raise DockerError(proc.stderr.decode("utf-8", "replace").strip())
 
@@ -168,8 +172,8 @@ def exec_in(container: str, argv: Iterable[str], timeout: float,
     if workdir:
         args += ["-w", workdir]
     args += [container, *argv]
-    return docker(*args, input_data=input_data, timeout=timeout, check=False,
-                  output_limit=output_limit)
+    return cast(ProcessResult, docker(*args, input_data=input_data, timeout=timeout, check=False,
+                                     output_limit=output_limit))
 
 
 def check_ready(network: str, url: str, expected_status: int, tools_image: str,

@@ -80,7 +80,7 @@ def test_remote_lifecycle(tmp_path, monkeypatch, relay_fails):
     session.prompt.return_value = {'success': True, 'data': {'disposition': 'queued'}}
     session.wait_settled.return_value = 'settled'
     monkeypatch.setattr(module, 'Sandbox', lambda *a: sandbox)
-    monkeypatch.setattr(module, 'PiSession', lambda *a: session)
+    monkeypatch.setattr(module, 'PiSession', lambda *a, **kw: session)
     monkeypatch.setattr(module, 'Gateway', lambda *a: Mock(url='gateway', token='token'))
     monkeypatch.setattr(module, '_tool_version', lambda *a: 'test')
     for name in ['load_task', 'prepare_build_context']:
